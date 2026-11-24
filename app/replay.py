@@ -1,4 +1,4 @@
-"""离散事件重放引擎。
+"""离散事件重放引擎（支持按同一抓包向后续算）。
 
 规则（全部时间为整数毫秒，时间轴从 0 开始，仿真区间 [0, replay_end)）：
 
@@ -14,13 +14,29 @@
    - 排队帧保留；新周期从实际生效时刻重新对齐（生效时刻即新周期的第 0 毫秒）。
 5. 告警从到达开始计时；发完即停止计时（耗时 = end - arrival），未发完则算到重放终点
    （耗时 = replay_end - arrival）；耗时严格大于告警时限即超时。
+
+实现分成两层：
+
+- ``_SimState`` 是某个终点时刻的完整仿真快照（配置、换配状态、队列、在发帧、
+  未入队到达事件、逐帧已记录结果）。快照大小只与帧数有关，与终点个数无关。
+- ``_run`` 从快照时刻继续推进到新的重放终点。终点延长时，跨旧终点的在发帧、
+  排队帧和待生效换配都在原快照上接着处理，跨终点前已完成的调度结果直接复用。
+
+进程内最多保留一份抓包快照（按“帧顺序 + 除 replay_end_ms 外的全部请求字段”识别）。
+并发长短请求由同一把锁串行化，且快照终点只增不减，短请求不会让已保留的进度回退。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import threading
 from dataclasses import dataclass
+from typing import Literal
 
 from .models import FrameResult, ReplayRequest, ReplayResponse, ReplayStats, SwitchInfo
+
+ReplayMode = Literal["cold", "resume"]
 
 
 @dataclass
@@ -36,6 +52,74 @@ class _Frame:
     arrived: bool = False
     transmitting: bool = False
     sent: bool = False
+
+
+@dataclass
+class _SimState:
+    """某一重放终点时刻的完整仿真快照。"""
+
+    end_t: int  # 快照对应的重放终点
+    period: int
+    reserve: int
+    anchor: int
+    switch_requested: bool
+    switch_time: int
+    new_period: int | None
+    new_reserve: int | None
+    switch_armed: bool
+    switched: bool
+    effective_switch: int | None
+    frames: list[_Frame]
+    queues: dict[str, list[_Frame]]
+    in_flight: _Frame | None
+    arrivals: list[int]  # 尚未入队的到达事件（输入下标），末尾为下一个
+    admitted_through: int
+
+    def clone(self) -> "_SimState":
+        """复制一份可变状态；缓存中的快照始终不被续算直接改写。"""
+        frames = [
+            _Frame(
+                idx=f.idx,
+                fid=f.fid,
+                ftype=f.ftype,
+                arrival=f.arrival,
+                busy=f.busy,
+                start=f.start,
+                end=f.end,
+                arrived=f.arrived,
+                transmitting=f.transmitting,
+                sent=f.sent,
+            )
+            for f in self.frames
+        ]
+        return _SimState(
+            end_t=self.end_t,
+            period=self.period,
+            reserve=self.reserve,
+            anchor=self.anchor,
+            switch_requested=self.switch_requested,
+            switch_time=self.switch_time,
+            new_period=self.new_period,
+            new_reserve=self.new_reserve,
+            switch_armed=self.switch_armed,
+            switched=self.switched,
+            effective_switch=self.effective_switch,
+            frames=frames,
+            queues={k: [frames[f.idx] for f in q] for k, q in self.queues.items()},
+            in_flight=frames[self.in_flight.idx] if self.in_flight is not None else None,
+            arrivals=list(self.arrivals),
+            admitted_through=self.admitted_through,
+        )
+
+
+@dataclass(frozen=True)
+class ReplayMeta:
+    """一次计算的旁路信息（不进入响应体，避免影响“响应与从头重放一致”）。"""
+
+    mode: ReplayMode
+    scheduling_steps: int
+    resumed_from_ms: int | None
+    checkpoint_end_ms: int
 
 
 def _segment_at(now: int, anchor: int, period: int, reserve: int) -> tuple[str, int]:
@@ -61,9 +145,7 @@ def _is_period_boundary(now: int, anchor: int, period: int) -> bool:
     return (now - anchor) % period == 0
 
 
-def simulate(req: ReplayRequest) -> ReplayResponse:
-    """执行一次完整重放，返回逐帧发送记录、切换结果与告警超时标记。"""
-
+def _initial_state(req: ReplayRequest) -> _SimState:
     frames = [
         _Frame(
             idx=i,
@@ -77,27 +159,52 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
     # 到达事件按 (时刻, 输入顺序) 排序，保证“同类按到达顺序发送”
     arrivals = sorted(range(len(frames)), key=lambda i: (frames[i].arrival, frames[i].idx))
     arrivals.reverse()  # 末尾为下一个待处理到达
+    return _SimState(
+        end_t=0,
+        period=req.period_ms,
+        reserve=req.reserve_ms,
+        anchor=0,  # 当前周期对齐起点（0 或换配实际生效时刻）
+        switch_requested=req.switch_at_ms is not None,
+        switch_time=req.switch_at_ms if req.switch_at_ms is not None else -1,
+        new_period=req.new_period_ms,
+        new_reserve=req.new_reserve_ms,
+        switch_armed=False,  # 换配时刻已到，等待下一个周期边界生效
+        switched=False,
+        effective_switch=None,
+        frames=frames,
+        queues={"alarm": [], "image": []},
+        in_flight=None,
+        arrivals=arrivals,
+        admitted_through=-1,  # 已入队到达事件的时间上界
+    )
 
-    period = req.period_ms
-    reserve = req.reserve_ms
-    anchor = 0  # 当前周期对齐起点（0 或换配实际生效时刻）
 
-    switch_requested = req.switch_at_ms is not None
-    switch_time = req.switch_at_ms if switch_requested else -1
-    switch_armed = False  # 换配时刻已到，等待下一个周期边界生效
-    switched = False
-    effective_switch: int | None = None
+def _run(st: _SimState, end_t: int) -> int:
+    """从快照时刻 ``st.end_t`` 继续仿真到 ``end_t``，原地更新 ``st``。
 
-    queues: dict[str, list[_Frame]] = {"alarm": [], "image": []}
-    in_flight: _Frame | None = None
-    now = 0
-    end_t = req.replay_end_ms
-    admitted_through = -1  # 已入队到达事件的时间上界，防止帧在到达前被提前入队
+    返回本次续算实际执行的调度步数（主循环迭代次数），用于对比续算与从头重放。
+    """
+    period = st.period
+    reserve = st.reserve
+    anchor = st.anchor
+    switch_requested = st.switch_requested
+    switch_time = st.switch_time
+    switch_armed = st.switch_armed
+    switched = st.switched
+    effective_switch = st.effective_switch
+    queues = st.queues
+    frames = st.frames
+    arrivals = st.arrivals
+    in_flight = st.in_flight
+    admitted_through = st.admitted_through
+
+    now = st.end_t
+    steps = 0
 
     def apply_switch(t: int) -> None:
         nonlocal period, reserve, anchor, switched, effective_switch, switch_armed
-        period = req.new_period_ms  # type: ignore[assignment]
-        reserve = req.new_reserve_ms  # type: ignore[assignment]
+        period = st.new_period  # type: ignore[assignment]
+        reserve = st.new_reserve  # type: ignore[assignment]
         anchor = t
         switched = True
         switch_armed = False
@@ -126,6 +233,7 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
         return None
 
     while now < end_t:
+        steps += 1
         # 统一入队点：每次进入循环（含发送完成、空转跳转后）都把截至 now 的到达事件收入队列。
         admit_arrivals(now)
         pending_switch = switch_requested and not switched
@@ -212,16 +320,35 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
         # seg_end 严格大于 now（半开时段），故 nxt > now，循环必然推进
         now = min(nxt, end_t)
 
-    # ---- 汇总输出 ----
+    # 收尾：快进到终点可能跳过了若干决策点，仍需把终点前（严格早于终点）已到达的帧
+    # 标记为已到达/排队，否则逐段续算与从头重放会得到不同的状态。
+    # 到达时刻恰为 end_t 的帧按约定仍算 not_arrived，故只入队到 end_t - 1。
+    admit_arrivals(end_t - 1)
+
+    st.end_t = end_t
+    st.period = period
+    st.reserve = reserve
+    st.anchor = anchor
+    st.switch_armed = switch_armed
+    st.switched = switched
+    st.effective_switch = effective_switch
+    st.in_flight = in_flight
+    st.admitted_through = admitted_through
+    return steps
+
+
+def _build_response(st: _SimState, req: ReplayRequest) -> ReplayResponse:
+    """由终点快照生成完整响应（与从头重放到同一终点的输出一致）。"""
+    end_t = st.end_t
     results: list[FrameResult] = []
     counts = {"sent": 0, "in_progress": 0, "queued": 0, "not_arrived": 0}
     alarm_total = 0
     alarm_timed_out = 0
 
-    for fr in frames:
+    for fr in st.frames:
         if fr.sent:
             status = "sent"
-        elif fr.transmitting and in_flight is fr:
+        elif fr.transmitting and st.in_flight is fr:
             status = "in_progress"
         elif fr.arrived:
             status = "queued"
@@ -257,21 +384,21 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
             )
         )
 
-    if not switch_requested:
+    if not st.switch_requested:
         switch_info = SwitchInfo(
             requested_at_ms=None, effective_at_ms=None, switched=False, state="not_requested"
         )
-    elif switched:
+    elif st.switched:
         switch_info = SwitchInfo(
-            requested_at_ms=switch_time,
-            effective_at_ms=effective_switch,
+            requested_at_ms=st.switch_time,
+            effective_at_ms=st.effective_switch,
             switched=True,
             state="switched",
         )
     else:
         # 未切换：要么换配时刻在终点之后，要么到点后等到的边界不早于终点
         switch_info = SwitchInfo(
-            requested_at_ms=switch_time,
+            requested_at_ms=st.switch_time,
             effective_at_ms=None,
             switched=False,
             state="not_switched",
@@ -282,11 +409,11 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
         switch=switch_info,
         initial_period_ms=req.period_ms,
         initial_reserve_ms=req.reserve_ms,
-        effective_period_ms=period,
-        effective_reserve_ms=reserve,
+        effective_period_ms=st.period,
+        effective_reserve_ms=st.reserve,
         frames=results,
         stats=ReplayStats(
-            total=len(frames),
+            total=len(st.frames),
             sent=counts["sent"],
             in_progress=counts["in_progress"],
             queued=counts["queued"],
@@ -294,4 +421,100 @@ def simulate(req: ReplayRequest) -> ReplayResponse:
             alarm_total=alarm_total,
             alarm_timed_out=alarm_timed_out,
         ),
+    )
+
+
+def simulate(req: ReplayRequest) -> ReplayResponse:
+    """从头执行一次完整重放（不读缓存、不写缓存），返回完整响应。"""
+    st = _initial_state(req)
+    _run(st, req.replay_end_ms)
+    return _build_response(st, req)
+
+
+# ---------------------------------------------------------------- 单份进度缓存
+def capture_key(req: ReplayRequest) -> str:
+    """抓包标识：帧顺序与其他全部请求字段相同才算同一份（不含 replay_end_ms）。"""
+    payload = req.model_dump(mode="json", exclude={"replay_end_ms"})
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+class _ProgressCache:
+    """进程内单槽进度缓存；锁同时保证并发长短请求不会让快照终点回退。"""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.key: str | None = None
+        self.state: _SimState | None = None
+
+    def reset(self) -> None:
+        with self.lock:
+            self.key = None
+            self.state = None
+
+    def snapshot(self) -> dict[str, int | str | None]:
+        with self.lock:
+            state = self.state
+            return {
+                # 只暴露抓包标识的摘要，避免把整份请求回显出来
+                "capture": (
+                    None
+                    if self.key is None
+                    else hashlib.sha256(self.key.encode()).hexdigest()[:16]
+                ),
+                "end_ms": state.end_t if state is not None else None,
+                "retained_states": 0 if state is None else 1,
+            }
+
+
+_PROGRESS = _ProgressCache()
+
+
+def reset_progress_cache() -> None:
+    """清空进程内进度缓存（主要供测试使用）。"""
+    _PROGRESS.reset()
+
+
+def progress_cache_snapshot() -> dict[str, int | str | None]:
+    """返回当前保留的唯一一份进度（测试/运维观察用）。"""
+    return _PROGRESS.snapshot()
+
+
+def simulate_cached(req: ReplayRequest) -> tuple[ReplayResponse, ReplayMeta]:
+    """带单槽进度缓存的重放：同一抓包终点后移时从已保留快照续算。
+
+    缓存中快照的终点只增不减：若并发/后到的请求终点更短，则本次从头重放，
+    但不会用更短的进度覆盖已保留的更长进度。
+    """
+    key = capture_key(req)
+    target = req.replay_end_ms
+
+    with _PROGRESS.lock:
+        checkpoint = _PROGRESS.state if _PROGRESS.key == key else None
+        if checkpoint is not None and checkpoint.end_t <= target:
+            work = checkpoint.clone()
+            resumed_from = checkpoint.end_t
+            mode: ReplayMode = "resume"
+        else:
+            work = _initial_state(req)
+            resumed_from = None
+            mode = "cold"
+
+        steps = _run(work, target)
+
+        # 写入策略（单槽）：换抓包直接替换；同抓包只允许终点前进，防止进度回退。
+        if _PROGRESS.key != key:
+            _PROGRESS.key = key
+            _PROGRESS.state = work
+        elif _PROGRESS.state is None or work.end_t > _PROGRESS.state.end_t:
+            _PROGRESS.state = work
+        # else：保留已有的更长进度
+
+        response = _build_response(work, req)
+        checkpoint_end = _PROGRESS.state.end_t if _PROGRESS.state is not None else target
+
+    return response, ReplayMeta(
+        mode=mode,
+        scheduling_steps=steps,
+        resumed_from_ms=resumed_from,
+        checkpoint_end_ms=checkpoint_end,
     )
